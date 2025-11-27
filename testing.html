@@ -1,0 +1,202 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const { githubUrl } = await req.json();
+
+    if (!githubUrl) {
+      throw new Error("GitHub URL is required");
+    }
+
+    console.log("Calculating credits for GitHub URL:", githubUrl);
+
+    // Extract owner, repo, and commit SHA from GitHub URL
+    // Supports formats like:
+    // - https://github.com/owner/repo/commit/sha
+    // - https://github.com/owner/repo/commits/sha
+    // - with optional query params or trailing slashes
+    const normalizedUrl = githubUrl.split('?')[0].replace(/\/+$/, '');
+    const urlPattern = /github\.com\/([^\/]+)\/([^\/]+)\/commit(?:s)?\/([0-9a-fA-F]{7,40})$/i;
+    const match = normalizedUrl.match(urlPattern);
+
+    if (!match) {
+      throw new Error("Invalid GitHub commit URL format. Expected a URL ending with /commit/<sha>");
+    }
+
+    const [, owner, repo, sha] = match;
+    console.log(`Parsed: owner=${owner}, repo=${repo}, sha=${sha}`);
+
+    // Extract username from commit link (owner)
+    const username = owner;
+
+    // Prepare headers once; use for all GitHub API requests
+    const headers: Record<string, string> = {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'Civora-Nexus-Bot',
+    };
+    try {
+      // Access env var safely (Supabase Edge Functions / Deno supports Deno.env)
+      // If not set, requests will be unauthenticated and may be rate-limited.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const token = (globalThis as any).Deno?.env?.get?.('GITHUB_TOKEN');
+      if (token) headers['Authorization'] = `token ${token}`;
+    } catch (e) {
+      // Deno.env access can throw in some runtimes; silently continue without token
+      console.warn('Could not read GITHUB_TOKEN from env:', e);
+    }
+
+    // Check repo visibility and organization
+    let repoInfo: any = null;
+    let repoError: string | null = null;
+    let isOrgRepo = false;
+    let isPublic = false;
+    let orgName = "CivoraX"; // Change to your org name if needed
+    try {
+      const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+      if (repoRes.ok) {
+        repoInfo = await repoRes.json();
+        isPublic = repoInfo.visibility === "public" || repoInfo.private === false;
+        isOrgRepo = repoInfo.owner?.type === "Organization" && repoInfo.owner?.login?.toLowerCase() === orgName.toLowerCase();
+      } else {
+        repoError = `Could not fetch repo info: ${repoRes.status}`;
+      }
+    } catch (e) {
+      repoError = `Error fetching repo info: ${e}`;
+    }
+
+    // ...existing code...
+
+    let commitData = null;
+    let additions = 0, deletions = 0, filesChanged = 0, totalLines = 0;
+    let commitMessage = "", author = "", committerUsername = "", orgDisplayName = "";
+    let errorMsg = "";
+    try {
+      const commitResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits/${sha}`, { headers });
+      if (!commitResponse.ok) {
+        const errorText = await commitResponse.text();
+        errorMsg = `GitHub API error: ${commitResponse.status} - ${errorText}`;
+        console.error(errorMsg);
+      } else {
+        commitData = await commitResponse.json();
+        console.log("Commit data received:", commitData && commitData.stats ? JSON.stringify(commitData.stats) : JSON.stringify(commitData));
+        const stats = commitData?.stats;
+        additions = stats?.additions ?? 0;
+        deletions = stats?.deletions ?? 0;
+        filesChanged = Array.isArray(commitData?.files) ? commitData.files.length : 0;
+        totalLines = additions + deletions;
+        commitMessage = commitData?.commit?.message ?? "";
+        author = commitData?.commit?.author?.name ?? "";
+        committerUsername = commitData?.committer?.login ?? commitData?.author?.login ?? "";
+      }
+    } catch (err) {
+      errorMsg = `Failed to fetch commit data: ${err}`;
+      console.error(errorMsg);
+    }
+
+    // Prepare repo/org/public status message
+    let repoStatusMsg = "";
+    let usernameAlert = "";
+    let base = 5, effort = 0, impact = 0, quality = 0, bonus = 2, credits = 0;
+    if (repoInfo && repoInfo.owner && repoInfo.owner.login) {
+      orgDisplayName = repoInfo.owner.login;
+    }
+    // Detailed error reporting for all 0-credit cases
+    if (repoError) {
+      repoStatusMsg = `Could not verify repo visibility or organization. (${repoError})`;
+      errorMsg = `Reason: The repository could not be found or accessed (e.g., 404 or permission issue). Please check the commit link and repo settings.`;
+      base = 0; effort = 0; impact = 0; quality = 0; bonus = 0; credits = 0;
+    } else if (!isPublic) {
+      repoStatusMsg = `Repo '${repo}' is private. Only public organization repos are accepted.`;
+      errorMsg = `Reason: The repository is private. Only public organization repositories are eligible for credits.`;
+      base = 0; effort = 0; impact = 0; quality = 0; bonus = 0; credits = 0;
+    } else if (!commitData) {
+      repoStatusMsg = `Could not fetch commit data.`;
+      errorMsg = `Reason: The commit could not be found or accessed. Please check the commit link and ensure it is valid.`;
+      base = 0; effort = 0; impact = 0; quality = 0; bonus = 0; credits = 0;
+    } else {
+      if (!isOrgRepo) {
+        repoStatusMsg = `Repo '${repo}' is not from our organization ('${orgName}').`;
+        errorMsg = `Alert: The repository is not part of the allowed organization ('${orgName}'). Credits are still calculated, but please verify if this is acceptable.`;
+      } else {
+        repoStatusMsg = `Repo '${repo}' is public and from our organization.`;
+      }
+      // Normal credit logic
+      if (committerUsername && username && committerUsername.toLowerCase() !== username.toLowerCase()) {
+        usernameAlert = `Warning: Committer username (${committerUsername}) does not match repo owner (${username}). Please verify the commit source.`;
+      }
+      if (totalLines >= 300) {
+        effort = 8;
+      } else if (totalLines >= 150) {
+        effort = 6;
+      } else if (totalLines >= 50) {
+        effort = 4;
+      } else if (totalLines >= 10) {
+        effort = 2;
+      }
+      if (filesChanged >= 8) {
+        impact = 4;
+      } else if (filesChanged >= 4) {
+        impact = 3;
+      } else if (filesChanged >= 2) {
+        impact = 2;
+      } else if (filesChanged >= 1) {
+        impact = 1;
+      }
+      const genericMessages = ["update", "fix", "changes", "commit", "test"];
+      if (commitMessage.length > 15 && !genericMessages.some(g => commitMessage.toLowerCase().includes(g))) {
+        quality = 3;
+      }
+      credits = base + effort + impact + quality + bonus;
+      credits = Math.min(credits, 20);
+    }
+    const breakdown = { base, effort, impact, quality, bonus };
+    console.log(`Calculated credits: ${credits} (Breakdown:`, breakdown, ")");
+
+    return new Response(
+      JSON.stringify({
+        credits,
+        breakdown,
+        stats: {
+          additions,
+          deletions,
+          filesChanged,
+          totalLines,
+        },
+        commitMessage,
+        author,
+        repo,
+        username,
+        committerUsername,
+        orgDisplayName,
+        repoStatusMsg,
+        usernameAlert,
+        isPublic,
+        isOrgRepo,
+        errorMsg,
+      }),
+      {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  } catch (error) {
+    console.error('Error calculating GitHub credits:', error);
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  }
+});
